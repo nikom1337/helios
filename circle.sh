@@ -10,6 +10,12 @@ case "$1" in
         exit 1
     fi
 
+    # install docker 1.6; as of 2015-10-26 Circle is giving us Docker 1.8 and some tests are failing
+    docker version
+    sudo curl -L -o /usr/bin/docker 'http://s3-external-1.amazonaws.com/circle-downloads/docker-1.6.x-circleci'
+    sudo chmod 0755 /usr/bin/docker
+    docker version
+
     # have docker bind to localhost
     docker_opts='DOCKER_OPTS="$DOCKER_OPTS -H tcp://0.0.0.0:2375"'
     sudo sh -c "echo '$docker_opts' >> /etc/default/docker"
