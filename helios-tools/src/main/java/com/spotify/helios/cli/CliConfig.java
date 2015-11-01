@@ -117,12 +117,11 @@ public class CliConfig {
    *
    * @param defaultsFile        The file to parse from
    * @return                    The configuration
-   * @throws IOException        If the file exists but could not be read
    * @throws URISyntaxException If a HELIOS_MASTER env var is present and doesn't parse as a URI
    */
   public static CliConfig fromFile(final File defaultsFile,
                                    final Map<String, String> environmentVariables)
-      throws IOException, URISyntaxException {
+      throws URISyntaxException {
 
     final Config config;
     if (defaultsFile.exists() && defaultsFile.canRead()) {

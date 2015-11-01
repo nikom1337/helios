@@ -51,7 +51,7 @@ public abstract class MultiTargetControlCommand implements CliCommand {
                  final BufferedReader stdin)
                      throws IOException, InterruptedException {
 
-    final Builder<TargetAndClient> clientBuilder = ImmutableList.<TargetAndClient>builder();
+    final Builder<TargetAndClient> clientBuilder = ImmutableList.builder();
     for (final Target target : targets) {
       final HeliosClient client = Utils.getClient(target, err, username);
       if (client == null) {

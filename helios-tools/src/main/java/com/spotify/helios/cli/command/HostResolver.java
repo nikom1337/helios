@@ -37,8 +37,7 @@ class HostResolver {
   private final Set<String> allHosts;
   private final Name[] searchPath;
 
-  HostResolver(final Set<String> allHosts,
-               final Name[] searchPath) throws InterruptedException, ExecutionException {
+  HostResolver(final Set<String> allHosts, final Name[] searchPath) {
     this.allHosts = allHosts;
     this.searchPath = searchPath;
   }
