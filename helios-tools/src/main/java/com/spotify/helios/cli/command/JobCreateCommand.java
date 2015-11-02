@@ -20,23 +20,21 @@ package com.spotify.helios.cli.command;
 import com.google.common.annotations.VisibleForTesting;
 import com.google.common.base.Supplier;
 import com.google.common.collect.ImmutableList;
-import com.google.common.collect.ImmutableMap;
-import com.google.common.collect.ImmutableMap.Builder;
 import com.google.common.collect.Iterables;
 import com.google.common.collect.Lists;
-import com.google.common.collect.Maps;
 
+import com.spotify.helios.cli.parser.EnvParser;
+import com.spotify.helios.cli.parser.HealthCheckParser;
+import com.spotify.helios.cli.parser.MetaDataParser;
+import com.spotify.helios.cli.parser.PortsParser;
+import com.spotify.helios.cli.parser.ResourcesParser;
+import com.spotify.helios.cli.parser.ServiceRegistrationsParser;
+import com.spotify.helios.cli.parser.VolumesParser;
 import com.spotify.helios.client.HeliosClient;
 import com.spotify.helios.common.JobValidator;
 import com.spotify.helios.common.Json;
-import com.spotify.helios.common.descriptors.ExecHealthCheck;
-import com.spotify.helios.common.descriptors.HttpHealthCheck;
 import com.spotify.helios.common.descriptors.Job;
 import com.spotify.helios.common.descriptors.JobId;
-import com.spotify.helios.common.descriptors.PortMapping;
-import com.spotify.helios.common.descriptors.ServiceEndpoint;
-import com.spotify.helios.common.descriptors.ServicePorts;
-import com.spotify.helios.common.descriptors.TcpHealthCheck;
 import com.spotify.helios.common.protocol.CreateJobResponse;
 
 import net.sourceforge.argparse4j.inf.Argument;
@@ -53,22 +51,13 @@ import java.nio.file.Files;
 import java.util.ArrayList;
 import java.util.Arrays;
 import java.util.Collection;
-import java.util.HashMap;
 import java.util.List;
 import java.util.Map;
 import java.util.concurrent.ExecutionException;
-import java.util.regex.Matcher;
-import java.util.regex.Pattern;
 
 import static com.google.common.base.Charsets.UTF_8;
-import static com.google.common.base.Optional.fromNullable;
 import static com.google.common.base.Strings.isNullOrEmpty;
 import static com.spotify.helios.common.descriptors.Job.EMPTY_TOKEN;
-import static com.spotify.helios.common.descriptors.PortMapping.TCP;
-import static com.spotify.helios.common.descriptors.ServiceEndpoint.HTTP;
-import static java.lang.String.format;
-import static java.util.Arrays.asList;
-import static java.util.regex.Pattern.compile;
 import static net.sourceforge.argparse4j.impl.Arguments.append;
 import static net.sourceforge.argparse4j.impl.Arguments.fileType;
 import static net.sourceforge.argparse4j.impl.Arguments.storeTrue;
@@ -76,20 +65,6 @@ import static net.sourceforge.argparse4j.impl.Arguments.storeTrue;
 public class JobCreateCommand extends ControlCommand {
 
   private static final JobValidator JOB_VALIDATOR = new JobValidator(false);
-
-  /**
-   * If any of the keys of this map are set as environment variables (i.e. an environment variable
-   * of GIT_COMMIT_ID=abcdef is set when this command is run), then an entry will be added to the
-   * job's metadata map with with key=this-maps-value, value=environment variable value.
-   *
-   * @see #defaultMetadata()
-   */
-  public static final Map<String, String> DEFAULT_METADATA_ENVVARS = ImmutableMap.of(
-      // GIT_COMMIT is set by the Git plugin in Jenkins, so for jobs created in
-      // Jenkins this will automatically set GIT_COMMIT = the sha1 of the
-      // working tree
-      "GIT_COMMIT", "GIT_COMMIT"
-  );
 
   // allow the retrieval of environment variables to be swapped out with a different Supplier for
   // testing purposes
@@ -122,6 +97,7 @@ public class JobCreateCommand extends ControlCommand {
   private final Argument securityOptArg;
   private final Argument networkModeArg;
   private final Argument metadataArg;
+  private final Argument resourcesArg;
   private final Supplier<Map<String, String>> envVarSupplier;
 
   public JobCreateCommand(final Subparser parser) {
@@ -254,6 +230,11 @@ public class JobCreateCommand extends ControlCommand {
         .help("Sets the networking mode for the container. Supported values are: bridge, host, and "
               + "container:<name|id>. Docker defaults to bridge.");
 
+      resourcesArg = parser.addArgument("--resource")
+              .action(append())
+              .setDefault(new ArrayList<String>())
+              .help("TODO");
+
     this.envVarSupplier = envVarSupplier;
   }
 
@@ -269,8 +250,6 @@ public class JobCreateCommand extends ControlCommand {
     final String id = options.getString(idArg.getDest());
     final String imageIdentifier = options.getString(imageArg.getDest());
 
-    // Read job configuration from file
-
     // TODO (dano): look for e.g. Heliosfile in cwd by default?
 
     final String templateJobId = options.getString(templateArg.getDest());
@@ -281,21 +260,16 @@ public class JobCreateCommand extends ControlCommand {
     }
 
     if (file != null) {
-      if (!file.exists() || !file.isFile() || !file.canRead()) {
-        throw new IllegalArgumentException("Cannot read file " + file);
-      }
-      final byte[] bytes = Files.readAllBytes(file.toPath());
-      final String config = new String(bytes, UTF_8);
-      final Job job = Json.read(config, Job.class);
+      final Job job = readConfigurationFromFile(file);
       builder = job.toBuilder();
-     } else if (templateJobId != null) {
+    } else if (templateJobId != null) {
       final Map<JobId, Job> jobs = client.jobs(templateJobId).get();
       if (jobs.size() == 0) {
         if (!json) {
           out.printf("Unknown job: %s%n", templateJobId);
         } else {
           CreateJobResponse createJobResponse =
-              new CreateJobResponse(CreateJobResponse.Status.UNKNOWN_JOB, null, null);
+                  new CreateJobResponse(CreateJobResponse.Status.UNKNOWN_JOB, null, null);
           out.printf(createJobResponse.toJsonString());
         }
         return 1;
@@ -304,7 +278,7 @@ public class JobCreateCommand extends ControlCommand {
           out.printf("Ambiguous job reference: %s%n", templateJobId);
         } else {
           CreateJobResponse createJobResponse =
-              new CreateJobResponse(CreateJobResponse.Status.AMBIGUOUS_JOB_REFERENCE, null, null);
+                  new CreateJobResponse(CreateJobResponse.Status.AMBIGUOUS_JOB_REFERENCE, null, null);
           out.printf(createJobResponse.toJsonString());
         }
         return 1;
@@ -317,14 +291,12 @@ public class JobCreateCommand extends ControlCommand {
     } else {
       if (id == null || imageIdentifier == null) {
         throw new IllegalArgumentException(
-            "Please specify a file, or a template, or a job name, version and container image");
+                "Please specify a file, or a template, or a job name, version and container image");
       }
       builder = Job.newBuilder();
     }
 
-
     // Merge job configuration options from command line arguments
-
     if (id != null) {
       final String[] parts = id.split(":");
       switch (parts.length) {
@@ -356,121 +328,19 @@ public class JobCreateCommand extends ControlCommand {
       builder.setCommand(command);
     }
 
-    final List<String> envList = options.getList(envArg.getDest());
-    // TODO (mbrown): does this mean that env config is only added when there is a CLI flag too?
-    if (!envList.isEmpty()) {
-      final Map<String, String> env = Maps.newHashMap();
-      // Add environmental variables from helios job configuration file
-      env.putAll(builder.getEnv());
-      // Add environmental variables passed in via CLI
-      // Overwrite any redundant keys to make CLI args take precedence
-      env.putAll(parseListOfPairs(envList, "environment variable"));
 
-      builder.setEnv(env);
-    }
-
-    Map<String, String> metadata = Maps.newHashMap();
-    metadata.putAll(defaultMetadata());
-    final List<String> metadataList = options.getList(metadataArg.getDest());
-    if (!metadataList.isEmpty()) {
-      // TODO (mbrown): values from job conf file (which maybe involves dereferencing env vars?)
-      metadata.putAll(parseListOfPairs(metadataList, "metadata"));
-    }
-    builder.setMetadata(metadata);
-
-    // Parse port mappings
-    final List<String> portSpecs = options.getList(portArg.getDest());
-    final Map<String, PortMapping> explicitPorts = Maps.newHashMap();
-    final Pattern portPattern = compile("(?<n>[_\\-\\w]+)=(?<i>\\d+)(:(?<e>\\d+))?(/(?<p>\\w+))?");
-    for (final String spec : portSpecs) {
-      final Matcher matcher = portPattern.matcher(spec);
-      if (!matcher.matches()) {
-        throw new IllegalArgumentException("Bad port mapping: " + spec);
-      }
-
-      final String portName = matcher.group("n");
-      final int internal = Integer.parseInt(matcher.group("i"));
-      final Integer external = nullOrInteger(matcher.group("e"));
-      final String protocol = fromNullable(matcher.group("p")).or(TCP);
-
-      if (explicitPorts.containsKey(portName)) {
-        throw new IllegalArgumentException("Duplicate port mapping: " + portName);
-      }
-
-      explicitPorts.put(portName, PortMapping.of(internal, external, protocol));
-    }
-
-    // Merge port mappings
-    final Map<String, PortMapping> ports = Maps.newHashMap();
-    ports.putAll(builder.getPorts());
-    ports.putAll(explicitPorts);
-    builder.setPorts(ports);
-
-    // Parse service registrations
-    final Map<ServiceEndpoint, ServicePorts> explicitRegistration = Maps.newHashMap();
-    final Pattern registrationPattern =
-        compile("(?<srv>[a-zA-Z][_\\-\\w]+)(?:/(?<prot>\\w+))?(?:=(?<port>[_\\-\\w]+))?");
-    final List<String> registrationSpecs = options.getList(registrationArg.getDest());
-    for (final String spec : registrationSpecs) {
-      final Matcher matcher = registrationPattern.matcher(spec);
-      if (!matcher.matches()) {
-        throw new IllegalArgumentException("Bad registration: " + spec);
-      }
-
-      final String service = matcher.group("srv");
-      final String proto = fromNullable(matcher.group("prot")).or(HTTP);
-      final String optionalPort = matcher.group("port");
-      final String port;
-
-      if (ports.size() == 0) {
-        throw new IllegalArgumentException("Need port mappings for service registration.");
-      }
-
-      if (optionalPort == null) {
-        if (ports.size() != 1) {
-          throw new IllegalArgumentException(
-              "Need exactly one port mapping for implicit service registration");
-        }
-        port = Iterables.getLast(ports.keySet());
-      } else {
-        port = optionalPort;
-      }
-
-      explicitRegistration.put(ServiceEndpoint.of(service, proto), ServicePorts.of(port));
-    }
+    new EnvParser(options.<String>getList(envArg.getDest())).execute(builder);
+    new MetaDataParser(options.<String>getList(metadataArg.getDest()), envVarSupplier.get()).execute(builder);
+    new PortsParser(options.<String>getList(portArg.getDest())).execute(builder);
+    new ServiceRegistrationsParser(options.<String>getList(registrationArg.getDest())).execute(builder);
+    new VolumesParser(options.<String>getList(volumeArg.getDest())).execute(builder);
 
     builder.setRegistrationDomain(options.getString(registrationDomainArg.getDest()));
-
-    // Merge service registrations
-    final Map<ServiceEndpoint, ServicePorts> registration = Maps.newHashMap();
-    registration.putAll(builder.getRegistration());
-    registration.putAll(explicitRegistration);
-    builder.setRegistration(registration);
 
     // Get grace period interval
     final Integer gracePeriod = options.getInt(gracePeriodArg.getDest());
     if (gracePeriod != null) {
       builder.setGracePeriod(gracePeriod);
-    }
-
-    // Parse volumes
-    final List<String> volumeSpecs = options.getList(volumeArg.getDest());
-    for (final String spec : volumeSpecs) {
-      final String[] parts = spec.split(":", 2);
-      switch (parts.length) {
-        // Data volume
-        case 1:
-          builder.addVolume(parts[0]);
-          break;
-        // Bind mount
-        case 2:
-          final String path = parts[1];
-          final String source = parts[0];
-          builder.addVolume(path, source);
-          break;
-        default:
-          throw new IllegalArgumentException("Invalid volume: " + spec);
-      }
     }
 
     // Parse expires timestamp
@@ -482,37 +352,10 @@ public class JobCreateCommand extends ControlCommand {
 
     // Parse health check
     final String execString = options.getString(healthCheckExecArg.getDest());
-    final List<String> execHealthCheck =
-        (execString == null) ? null : Arrays.asList(execString.split(" "));
     final String httpHealthCheck = options.getString(healthCheckHttpArg.getDest());
     final String tcpHealthCheck = options.getString(healthCheckTcpArg.getDest());
-
-    int numberOfHealthChecks = 0;
-    for (final String c : asList(httpHealthCheck, tcpHealthCheck)) {
-      if (!isNullOrEmpty(c)) {
-        numberOfHealthChecks++;
-      }
-    }
-    if (execHealthCheck != null && !execHealthCheck.isEmpty()) {
-      numberOfHealthChecks++;
-    }
-
-    if (numberOfHealthChecks > 1) {
-      throw new IllegalArgumentException("Only one health check may be specified.");
-    }
-
-    if (execHealthCheck != null && !execHealthCheck.isEmpty()) {
-      builder.setHealthCheck(ExecHealthCheck.of(execHealthCheck));
-    } else if (!isNullOrEmpty(httpHealthCheck)) {
-      final String[] parts = httpHealthCheck.split(":", 2);
-      if (parts.length != 2) {
-        throw new IllegalArgumentException("Invalid HTTP health check: " + httpHealthCheck);
-      }
-
-      builder.setHealthCheck(HttpHealthCheck.of(parts[0], parts[1]));
-    } else if (!isNullOrEmpty(tcpHealthCheck)) {
-      builder.setHealthCheck(TcpHealthCheck.of(tcpHealthCheck));
-    }
+    final List<String> execHealthCheck = (execString == null) ? null : Arrays.asList(execString.split(" "));
+    new HealthCheckParser(httpHealthCheck, tcpHealthCheck, execHealthCheck).execute(builder);
 
     final List<String> securityOpt = options.getList(securityOptArg.getDest());
     if (securityOpt != null && !securityOpt.isEmpty()) {
@@ -528,6 +371,8 @@ public class JobCreateCommand extends ControlCommand {
     if (!isNullOrEmpty(token)) {
       builder.setToken(token);
     }
+
+    new ResourcesParser(options.<String>getList(resourcesArg.getDest())).execute(builder);
 
     // We build without a hash here because we want the hash to be calculated server-side.
     // This allows different CLI versions to be cross-compatible with different master versions
@@ -575,54 +420,13 @@ public class JobCreateCommand extends ControlCommand {
     }
   }
 
-  /**
-   * Metadata to associate with jobs by default. Currently sets some metadata based upon environment
-   * variables set when the CLI command is run.
-   */
-  private Map<String, String> defaultMetadata() {
-
-    final Builder<String, String> builder = ImmutableMap.builder();
-
-    final Map<String, String> envVars = envVarSupplier.get();
-
-    for (final Map.Entry<String, String> entry : DEFAULT_METADATA_ENVVARS.entrySet()) {
-      final String envKey = entry.getKey();
-      final String metadataKey = entry.getValue();
-
-      final String envValue = envVars.get(envKey);
-      if (envValue != null) {
-        builder.put(metadataKey, envValue);
-      }
+  private Job readConfigurationFromFile(File file) throws IOException {
+    if (!file.exists() || !file.isFile() || !file.canRead()) {
+      throw new IllegalArgumentException("Cannot read file " + file);
     }
-
-    return builder.build();
-  }
-
-  private static Map<String, String> parseListOfPairs(final List<String> list,
-                                                      final String fieldName) {
-    return parseListOfPairs(list, fieldName, "=");
-  }
-
-  private static Map<String, String> parseListOfPairs(final List<String> list,
-                                                      final String fieldName,
-                                                      final String delimiter) {
-    final Map<String, String> pairs = new HashMap<>();
-    for (final String s : list) {
-      final String[] parts = s.split(delimiter, 2);
-      if (parts.length != 2) {
-        throw new IllegalArgumentException(
-            format("Bad format for %s: '%s', expecting %s-delimited pairs",
-                fieldName,
-                s,
-                delimiter));
-      }
-      pairs.put(parts[0], parts[1]);
-    }
-    return pairs;
-  }
-
-  private Integer nullOrInteger(final String s) {
-    return s == null ? null : Integer.valueOf(s);
+    final byte[] bytes = Files.readAllBytes(file.toPath());
+    final String config = new String(bytes, UTF_8);
+    return Json.read(config, Job.class);
   }
 }
 
